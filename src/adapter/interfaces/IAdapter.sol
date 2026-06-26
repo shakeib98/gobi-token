@@ -2,17 +2,13 @@
 pragma solidity ^0.8.20;
 
 interface IAdapter {
-    function setExclusionStatus(address account, bool excluded) external;
-
-    function admitTreasury(address holder, uint256 amount) external;
-
-    function depositFirstYield(uint256 amount, string calldata ipfsHash) external;
-
-    function depositRegularYield(uint256 amount, string calldata ipfsHash) external;
-
+    function addExclusion(address account) external;
+    function removeExclusion(address account) external;
+    function isExcluded(address account) external view returns (bool);
+    function excludedCount() external view returns (uint256);
+    function excludedAt(uint256 index) external view returns (address);
+    function depositYield(uint256 amount, string calldata ipfsHash) external;
     function claimWallet(uint256[] calldata epochIds) external;
-
-    function emergencyWithdrawRewards(
-        address recipient
-    ) external;
+    function emergencyWithdrawRewards(address recipient) external;
+    function claimableWallet(uint256 epochId, address account) external view returns (uint256);
 }
