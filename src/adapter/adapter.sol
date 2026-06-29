@@ -31,12 +31,19 @@ contract Adapter is IAdapter, AccessControl, ReentrancyGuard {
     mapping(uint256 => mapping(address => bool)) public epochExcluded;
     mapping(uint256 => mapping(address => bool)) public claimedWallet;
 
+    // outstanding = totalDeposited - totalClaimed is the upper bound on what
+    // holders are still owed (rounds high because payouts round down), which
+    // keeps sweepExcess conservative.
+    uint256 public totalDeposited;
+    uint256 public totalClaimed;
+
     event ExclusionSet(address indexed account, bool excluded);
     event YieldDeposited(
         uint256 indexed epochId, uint256 amount, uint256 snapshotId, uint256 eligibleSupply, string ipfsHash
     );
     event Claimed(uint256 indexed epochId, address indexed claimant, uint256 payout);
-    event EmergencyRewardsWithdrawn(address indexed recipient, uint256 amount);
+    event ExcessSwept(address indexed recipient, uint256 amount);
+    event TokenRescued(address indexed token, address indexed recipient, uint256 amount);
 
     constructor(address defaultAdmin, address _yieldAsset, address _gobiToken, address _sablier) {
         require(defaultAdmin != address(0), "Adapter: Admin zero address");
@@ -65,18 +72,6 @@ contract Adapter is IAdapter, AccessControl, ReentrancyGuard {
         emit ExclusionSet(account, false);
     }
 
-    function isExcluded(address account) external view returns (bool) {
-        return _excluded.contains(account);
-    }
-
-    function excludedCount() external view returns (uint256) {
-        return _excluded.length();
-    }
-
-    function excludedAt(uint256 index) external view returns (address) {
-        return _excluded.at(index);
-    }
-
     function depositYield(uint256 amount, string calldata ipfsHash) external override onlyRole(DEPOSITOR_ROLE) {
         require(amount > 0, "Adapter: Deposit must exceed zero");
         require(bytes(ipfsHash).length > 0, "Adapter: IPFS hash cannot be empty");
@@ -102,6 +97,7 @@ contract Adapter is IAdapter, AccessControl, ReentrancyGuard {
             Epoch({snapshotId: snapId, totalUsdtAmount: amount, supplyAtSnapshot: eligibleSupply, ipfsHash: ipfsHash});
 
         currentEpochId++;
+        totalDeposited += amount;
         yieldAsset.safeTransferFrom(msg.sender, address(this), amount);
         emit YieldDeposited(epochId, amount, snapId, eligibleSupply, ipfsHash);
     }
@@ -111,12 +107,18 @@ contract Adapter is IAdapter, AccessControl, ReentrancyGuard {
         for (uint256 i = 0; i < epochIds.length; i++) {
             uint256 id = epochIds[i];
             require(id < currentEpochId, "Adapter: Non-existent epoch");
-            if (claimedWallet[id][msg.sender]) continue;
-            if (epochExcluded[id][msg.sender]) continue;
+            if (claimedWallet[id][msg.sender]) {
+                continue;
+            }
+            if (epochExcluded[id][msg.sender]) {
+                continue;
+            }
 
             Epoch storage epoch = epochs[id];
             uint256 balance = gobiToken.balanceOfAt(msg.sender, epoch.snapshotId);
-            if (balance == 0) continue;
+            if (balance == 0) {
+                continue;
+            }
 
             uint256 payout = (epoch.totalUsdtAmount * balance) / epoch.supplyAtSnapshot;
             if (payout > 0) {
@@ -126,23 +128,60 @@ contract Adapter is IAdapter, AccessControl, ReentrancyGuard {
             }
         }
         require(totalPayout > 0, "Adapter: No claimable yield available");
+        totalClaimed += totalPayout;
         yieldAsset.safeTransfer(msg.sender, totalPayout);
     }
 
-    function emergencyWithdrawRewards(address recipient) external override onlyRole(DEFAULT_ADMIN_ROLE) nonReentrant {
+    /// @notice Sweep only the surplus: balance minus outstanding liability.
+    /// Captures rounding dust and any yield asset sent in directly. Can never
+    /// reduce the balance below what holders are owed, so it is not a drain.
+    function sweepExcess(address recipient) external override onlyRole(DEFAULT_ADMIN_ROLE) nonReentrant {
         require(recipient != address(0), "Adapter: Recipient zero address");
-        uint256 entireRewardBalance = yieldAsset.balanceOf(address(this));
-        require(entireRewardBalance > 0, "Adapter: No reward assets present");
-        emit EmergencyRewardsWithdrawn(recipient, entireRewardBalance);
-        yieldAsset.safeTransfer(recipient, entireRewardBalance);
+        uint256 outstanding = totalDeposited - totalClaimed;
+        uint256 bal = yieldAsset.balanceOf(address(this));
+        require(bal > outstanding, "Adapter: No excess to sweep");
+        uint256 excess = bal - outstanding;
+        emit ExcessSwept(recipient, excess);
+        yieldAsset.safeTransfer(recipient, excess);
     }
 
-    function claimableWallet(uint256 epochId, address account) public view returns (uint256) {
+    /// @notice Rescue foreign tokens accidentally sent here. Explicitly blocked
+    /// from the yield asset (use sweepExcess for that).
+    function rescueToken(address token, address recipient, uint256 amount)
+        external
+        override
+        onlyRole(DEFAULT_ADMIN_ROLE)
+        nonReentrant
+    {
+        require(token != address(yieldAsset), "Adapter: Use sweepExcess");
+        require(recipient != address(0), "Adapter: Recipient zero address");
+        require(amount > 0, "Adapter: Amount must exceed zero");
+        emit TokenRescued(token, recipient, amount);
+        IERC20(token).safeTransfer(recipient, amount);
+    }
+
+    function outstandingLiability() external view override returns (uint256) {
+        return totalDeposited - totalClaimed;
+    }
+
+    function claimableWallet(uint256 epochId, address account) external view override returns (uint256) {
         if (epochId >= currentEpochId || epochExcluded[epochId][account] || claimedWallet[epochId][account]) {
             return 0;
         }
         Epoch storage epoch = epochs[epochId];
         uint256 balance = gobiToken.balanceOfAt(account, epoch.snapshotId);
         return (epoch.totalUsdtAmount * balance) / epoch.supplyAtSnapshot;
+    }
+
+    function isExcluded(address account) external view override returns (bool) {
+        return _excluded.contains(account);
+    }
+
+    function excludedCount() external view override returns (uint256) {
+        return _excluded.length();
+    }
+
+    function excludedAt(uint256 index) external view override returns (address) {
+        return _excluded.at(index);
     }
 }

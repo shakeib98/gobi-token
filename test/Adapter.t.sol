@@ -18,6 +18,15 @@ contract MockUSDT is ERC20 {
     }
 }
 
+// Arbitrary foreign token for rescueToken tests
+contract MockForeign is ERC20 {
+    constructor() ERC20("Foreign", "FRN") {}
+
+    function mint(address to, uint256 amount) external {
+        _mint(to, amount);
+    }
+}
+
 contract AdapterTest is Test {
     Adapter internal adapter;
     GobiToken internal gobi;
@@ -54,7 +63,7 @@ contract AdapterTest is Test {
         gobi.transfer(holderB, 200 * G);
         gobi.transfer(treasury, 700 * G);
 
-        adapter.addExclusion(admin);
+        adapter.addExclusion(admin); // multisig holds the bulk
         adapter.addExclusion(treasury);
         vm.stopPrank();
 
@@ -63,6 +72,7 @@ contract AdapterTest is Test {
         usdt.approve(address(adapter), type(uint256).max);
     }
 
+    // --- helpers ---
     function _deposit(uint256 amount, string memory cid) internal {
         vm.prank(distributor);
         adapter.depositYield(amount, cid);
@@ -72,6 +82,13 @@ contract AdapterTest is Test {
         ids = new uint256[](1);
         ids[0] = a;
     }
+
+    function _claim(address who, uint256 id) internal {
+        vm.prank(who);
+        adapter.claimWallet(_ids(id));
+    }
+
+    // ===== Deployment / wiring =====
 
     function test_DeploymentState() public {
         assertEq(address(adapter.yieldAsset()), address(usdt));
@@ -94,6 +111,8 @@ contract AdapterTest is Test {
         _deposit(1000 * USDT_UNIT, "cid");
         assertEq(adapter.currentEpochId(), 1);
     }
+
+    // ===== Deposit: derived denominator + exclusion freeze =====
 
     function test_DepositDerivesDenominator() public {
         _deposit(1000 * USDT_UNIT, "cid0");
@@ -125,15 +144,15 @@ contract AdapterTest is Test {
         vm.stopPrank();
     }
 
+    // ===== Claims: math + solvency invariant =====
+
     function test_ClaimPayoutMath() public {
         _deposit(1000 * USDT_UNIT, "cid0");
         uint256 expA = (1000 * USDT_UNIT * 100 * G) / (300 * G);
         uint256 expB = (1000 * USDT_UNIT * 200 * G) / (300 * G);
         assertEq(adapter.claimableWallet(0, holderA), expA);
-        vm.prank(holderA);
-        adapter.claimWallet(_ids(0));
-        vm.prank(holderB);
-        adapter.claimWallet(_ids(0));
+        _claim(holderA, 0);
+        _claim(holderB, 0);
         assertEq(usdt.balanceOf(holderA), expA);
         assertEq(usdt.balanceOf(holderB), expB);
     }
@@ -141,10 +160,8 @@ contract AdapterTest is Test {
     function test_Invariant_ClaimsNeverExceedDeposit() public {
         uint256 amount = 1000 * USDT_UNIT;
         _deposit(amount, "cid0");
-        vm.prank(holderA);
-        adapter.claimWallet(_ids(0));
-        vm.prank(holderB);
-        adapter.claimWallet(_ids(0));
+        _claim(holderA, 0);
+        _claim(holderB, 0);
         uint256 paidOut = usdt.balanceOf(holderA) + usdt.balanceOf(holderB);
         assertLe(paidOut, amount);
         assertEq(usdt.balanceOf(address(adapter)), amount - paidOut);
@@ -182,6 +199,21 @@ contract AdapterTest is Test {
         vm.expectRevert(bytes("Adapter: Non-existent epoch"));
         adapter.claimWallet(_ids(99));
     }
+
+    function test_ClaimMultipleEpochsAtOnce() public {
+        _deposit(1000 * USDT_UNIT, "cid0");
+        _deposit(500 * USDT_UNIT, "cid1");
+        uint256[] memory ids = new uint256[](2);
+        ids[0] = 0;
+        ids[1] = 1;
+        uint256 exp0 = (1000 * USDT_UNIT * 100 * G) / (300 * G);
+        uint256 exp1 = (500 * USDT_UNIT * 100 * G) / (300 * G);
+        vm.prank(holderA);
+        adapter.claimWallet(ids);
+        assertEq(usdt.balanceOf(holderA), exp0 + exp1);
+    }
+
+    // ===== Exclusion freeze across epochs =====
 
     function test_Freeze_UnexcludedCannotClaimPastEpoch() public {
         _deposit(1000 * USDT_UNIT, "cid0");
@@ -225,56 +257,175 @@ contract AdapterTest is Test {
         adapter.removeExclusion(holderA);
     }
 
-    function test_Emergency_DrainsAll() public {
+    // ===== outstandingLiability accounting =====
+
+    function test_Liability_StartsZero() public {
+        assertEq(adapter.outstandingLiability(), 0);
+        assertEq(adapter.totalDeposited(), 0);
+        assertEq(adapter.totalClaimed(), 0);
+    }
+
+    function test_Liability_RisesOnDeposit() public {
         _deposit(1000 * USDT_UNIT, "cid0");
-        uint256 bal = usdt.balanceOf(address(adapter));
-        vm.prank(admin);
-        adapter.emergencyWithdrawRewards(rescuer);
-        assertEq(usdt.balanceOf(address(adapter)), 0);
-        assertEq(usdt.balanceOf(rescuer), bal);
+        assertEq(adapter.totalDeposited(), 1000 * USDT_UNIT);
+        assertEq(adapter.outstandingLiability(), 1000 * USDT_UNIT);
     }
 
-    function test_Emergency_OnlyAdmin() public {
+    function test_Liability_FallsOnClaim() public {
         _deposit(1000 * USDT_UNIT, "cid0");
-        vm.prank(distributor);
-        vm.expectRevert();
-        adapter.emergencyWithdrawRewards(rescuer);
+        _claim(holderA, 0);
+        uint256 paidA = usdt.balanceOf(holderA);
+        assertEq(adapter.totalClaimed(), paidA);
+        assertEq(adapter.outstandingLiability(), 1000 * USDT_UNIT - paidA);
     }
 
-    function test_Emergency_RevertsWhenEmpty() public {
-        vm.prank(admin);
-        vm.expectRevert(bytes("Adapter: No reward assets present"));
-        adapter.emergencyWithdrawRewards(rescuer);
-    }
-
-    function test_Emergency_ZeroRecipientReverts() public {
-        _deposit(1000 * USDT_UNIT, "cid0");
-        vm.prank(admin);
-        vm.expectRevert(bytes("Adapter: Recipient zero address"));
-        adapter.emergencyWithdrawRewards(address(0));
-    }
-
-    function test_ClaimRevertsAfterDrain() public {
-        _deposit(1000 * USDT_UNIT, "cid0");
-        vm.prank(admin);
-        adapter.emergencyWithdrawRewards(rescuer);
-        vm.prank(holderA);
-        vm.expectRevert();
-        adapter.claimWallet(_ids(0));
-    }
-
-    function test_ClaimMultipleEpochsAtOnce() public {
+    function test_Liability_AccumulatesAcrossEpochs() public {
         _deposit(1000 * USDT_UNIT, "cid0");
         _deposit(500 * USDT_UNIT, "cid1");
-        uint256[] memory ids = new uint256[](2);
-        ids[0] = 0;
-        ids[1] = 1;
-        uint256 exp0 = (1000 * USDT_UNIT * 100 * G) / (300 * G);
-        uint256 exp1 = (500 * USDT_UNIT * 100 * G) / (300 * G);
-        vm.prank(holderA);
-        adapter.claimWallet(ids);
-        assertEq(usdt.balanceOf(holderA), exp0 + exp1);
+        assertEq(adapter.totalDeposited(), 1500 * USDT_UNIT);
+        assertEq(adapter.outstandingLiability(), 1500 * USDT_UNIT);
     }
+
+    // ===== sweepExcess (safe recovery, no drain) =====
+
+    function test_Sweep_RevertsRightAfterDeposit() public {
+        _deposit(1000 * USDT_UNIT, "cid0"); // balance == outstanding
+        vm.prank(admin);
+        vm.expectRevert(bytes("Adapter: No excess to sweep"));
+        adapter.sweepExcess(rescuer);
+    }
+
+    function test_Sweep_RevertsWhileAnyoneIsOwed() public {
+        _deposit(1000 * USDT_UNIT, "cid0");
+        _claim(holderA, 0); // holderB still owed
+        vm.prank(admin);
+        vm.expectRevert(bytes("Adapter: No excess to sweep"));
+        adapter.sweepExcess(rescuer);
+    }
+
+    function test_Sweep_RevertsOnEmptyContract() public {
+        vm.prank(admin);
+        vm.expectRevert(bytes("Adapter: No excess to sweep"));
+        adapter.sweepExcess(rescuer);
+    }
+
+    function test_Sweep_RecoversDirectlySentFunds() public {
+        _deposit(1000 * USDT_UNIT, "cid0");
+        usdt.mint(address(adapter), 250 * USDT_UNIT); // stray transfer = pure excess
+        uint256 before = usdt.balanceOf(rescuer);
+        vm.prank(admin);
+        adapter.sweepExcess(rescuer);
+        assertEq(usdt.balanceOf(rescuer) - before, 250 * USDT_UNIT);
+        assertEq(usdt.balanceOf(address(adapter)), 1000 * USDT_UNIT); // owed untouched
+    }
+
+    function test_Sweep_OnlyExcessNotOwed_AfterClaims() public {
+        _deposit(1000 * USDT_UNIT, "cid0");
+        _claim(holderA, 0);
+        _claim(holderB, 0);
+        usdt.mint(address(adapter), 40 * USDT_UNIT);
+        uint256 before = usdt.balanceOf(rescuer);
+        vm.prank(admin);
+        adapter.sweepExcess(rescuer);
+        assertEq(usdt.balanceOf(rescuer) - before, 40 * USDT_UNIT); // dust stays locked
+    }
+
+    function test_Sweep_CannotBeCalledTwiceToDrain() public {
+        _deposit(1000 * USDT_UNIT, "cid0");
+        usdt.mint(address(adapter), 100 * USDT_UNIT);
+        vm.prank(admin);
+        adapter.sweepExcess(rescuer);
+        vm.prank(admin);
+        vm.expectRevert(bytes("Adapter: No excess to sweep"));
+        adapter.sweepExcess(rescuer);
+    }
+
+    function test_Sweep_RevertsZeroRecipient() public {
+        _deposit(1000 * USDT_UNIT, "cid0");
+        usdt.mint(address(adapter), 10 * USDT_UNIT);
+        vm.prank(admin);
+        vm.expectRevert(bytes("Adapter: Recipient zero address"));
+        adapter.sweepExcess(address(0));
+    }
+
+    function test_Sweep_OnlyAdmin() public {
+        _deposit(1000 * USDT_UNIT, "cid0");
+        usdt.mint(address(adapter), 10 * USDT_UNIT);
+        vm.prank(distributor);
+        vm.expectRevert();
+        adapter.sweepExcess(rescuer);
+    }
+
+    function test_Sweep_EmitsEvent() public {
+        _deposit(1000 * USDT_UNIT, "cid0");
+        usdt.mint(address(adapter), 77 * USDT_UNIT);
+        vm.expectEmit(true, false, false, true, address(adapter));
+        emit Adapter.ExcessSwept(rescuer, 77 * USDT_UNIT);
+        vm.prank(admin);
+        adapter.sweepExcess(rescuer);
+    }
+
+    // ===== rescueToken (foreign tokens only) =====
+
+    function test_Rescue_RecoversForeignToken() public {
+        MockForeign frn = new MockForeign();
+        frn.mint(address(adapter), 123 ether);
+        vm.prank(admin);
+        adapter.rescueToken(address(frn), rescuer, 123 ether);
+        assertEq(frn.balanceOf(rescuer), 123 ether);
+        assertEq(frn.balanceOf(address(adapter)), 0);
+    }
+
+    function test_Rescue_PartialAmount() public {
+        MockForeign frn = new MockForeign();
+        frn.mint(address(adapter), 100 ether);
+        vm.prank(admin);
+        adapter.rescueToken(address(frn), rescuer, 30 ether);
+        assertEq(frn.balanceOf(rescuer), 30 ether);
+        assertEq(frn.balanceOf(address(adapter)), 70 ether);
+    }
+
+    function test_Rescue_BlockedFromYieldAsset() public {
+        _deposit(1000 * USDT_UNIT, "cid0");
+        vm.prank(admin);
+        vm.expectRevert(bytes("Adapter: Use sweepExcess"));
+        adapter.rescueToken(address(usdt), rescuer, 1);
+    }
+
+    function test_Rescue_RevertsZeroRecipient() public {
+        MockForeign frn = new MockForeign();
+        frn.mint(address(adapter), 1 ether);
+        vm.prank(admin);
+        vm.expectRevert(bytes("Adapter: Recipient zero address"));
+        adapter.rescueToken(address(frn), address(0), 1 ether);
+    }
+
+    function test_Rescue_RevertsZeroAmount() public {
+        MockForeign frn = new MockForeign();
+        frn.mint(address(adapter), 1 ether);
+        vm.prank(admin);
+        vm.expectRevert(bytes("Adapter: Amount must exceed zero"));
+        adapter.rescueToken(address(frn), rescuer, 0);
+    }
+
+    function test_Rescue_OnlyAdmin() public {
+        MockForeign frn = new MockForeign();
+        frn.mint(address(adapter), 1 ether);
+        vm.prank(distributor);
+        vm.expectRevert();
+        adapter.rescueToken(address(frn), rescuer, 1 ether);
+    }
+
+    function test_Rescue_EmitsEvent() public {
+        MockForeign frn = new MockForeign();
+        frn.mint(address(adapter), 5 ether);
+        vm.expectEmit(true, true, false, true, address(adapter));
+        emit Adapter.TokenRescued(address(frn), rescuer, 5 ether);
+        vm.prank(admin);
+        adapter.rescueToken(address(frn), rescuer, 5 ether);
+    }
+
+    // ===== Fuzz =====
 
     function testFuzz_ClaimsNeverExceedDeposit(uint96 amount, uint96 balA, uint96 balB) public {
         amount = uint96(bound(amount, 1, 1_000_000 * USDT_UNIT));
@@ -300,5 +451,25 @@ contract AdapterTest is Test {
         }
         uint256 paid = before - usdt.balanceOf(address(adapter));
         assertLe(paid, amount);
+    }
+
+    function testFuzz_Sweep_NeverTakesOwed(uint96 deposit, uint96 stray) public {
+        deposit = uint96(bound(deposit, 1, 500_000 * USDT_UNIT));
+        stray = uint96(bound(stray, 0, 500_000 * USDT_UNIT));
+        usdt.mint(distributor, deposit);
+        vm.prank(distributor);
+        adapter.depositYield(deposit, "fuzz");
+        if (stray > 0) usdt.mint(address(adapter), stray);
+        uint256 owed = adapter.outstandingLiability();
+        if (stray == 0) {
+            vm.prank(admin);
+            vm.expectRevert(bytes("Adapter: No excess to sweep"));
+            adapter.sweepExcess(rescuer);
+        } else {
+            vm.prank(admin);
+            adapter.sweepExcess(rescuer);
+            assertEq(usdt.balanceOf(rescuer), stray, "swept exactly the stray amount");
+        }
+        assertGe(usdt.balanceOf(address(adapter)), owed);
     }
 }
