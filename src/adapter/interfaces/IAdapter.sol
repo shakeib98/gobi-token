@@ -13,6 +13,8 @@ interface IAdapter {
     function claimWallet(uint256[] calldata epochIds) external;
     function sweepExcess(address recipient) external;
     function rescueToken(address token, address recipient, uint256 amount) external;
+    function setClaimWindow(uint256 newWindow) external;
+    function reclaimExpired(uint256 epochId, address recipient) external;
     function outstandingLiability() external view returns (uint256);
     function claimableWallet(uint256 epochId, address account) external view returns (uint256);
 }
